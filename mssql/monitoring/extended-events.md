@@ -135,6 +135,86 @@ WITH (
 );
 ```
 
+### Reading Deadlocks from system_health (No Setup Required)
+
+The default `system_health` session captures deadlocks automatically. No custom XE session needed for basic deadlock analysis:
+
+```sql
+-- Extract deadlock XML from system_health ring buffer
+SELECT XEvent.query('(event/data/value/deadlock)[1]') AS deadlock_graph
+FROM (
+    SELECT CAST(target_data AS XML) AS TargetData
+    FROM sys.dm_xe_session_targets st
+    JOIN sys.dm_xe_sessions s ON s.address = st.event_session_address
+    WHERE s.name = 'system_health'
+        AND st.target_name = 'ring_buffer'
+) AS Data
+CROSS APPLY TargetData.nodes('RingBufferTarget/event[@name="xml_deadlock_report"]') AS XEventData(XEvent);
+
+-- Extract deadlocks from system_health file target (persisted across restarts)
+SELECT
+    event_data.value('(event/@timestamp)[1]', 'datetime2') AS deadlock_time,
+    event_data.query('(event/data/value/deadlock)[1]') AS deadlock_graph
+FROM (
+    SELECT CAST(event_data AS XML) AS event_data
+    FROM sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL, NULL)
+    WHERE object_name = 'xml_deadlock_report'
+) x
+ORDER BY deadlock_time DESC;
+```
+
+In SSMS: navigate to **Management > Extended Events > Sessions > system_health > package0.event_file**, right-click, "View Target Data", then filter by name = `xml_deadlock_report`. Click the **Deadlock** tab for visual graph.
+
+### Locking and Blocking Monitor
+
+```sql
+-- Real-time blocking chain detection
+CREATE EVENT SESSION [BlockingMonitor]
+ON SERVER
+ADD EVENT sqlserver.blocked_process_report
+(
+    ACTION (
+        sqlserver.database_name,
+        sqlserver.session_id,
+        sqlserver.sql_text,
+        sqlserver.client_hostname
+    )
+)
+ADD TARGET package0.event_file
+(
+    SET filename = N'C:\XE\Blocking.xel',
+        max_file_size = 50,
+        max_rollover_files = 10
+)
+WITH (
+    MAX_MEMORY = 4096 KB,
+    STARTUP_STATE = ON
+);
+
+-- Must set blocked process threshold (seconds) for events to fire
+EXEC sp_configure 'blocked process threshold (s)', 5;
+RECONFIGURE;
+```
+
+### SQL Server Lock Modes Quick Reference
+
+| Mode | Name | Compatible With | Use |
+|------|------|----------------|-----|
+| S | Shared | S, IS, U | SELECT reads |
+| U | Update | S, IS | Scan for update target |
+| X | Exclusive | None | INSERT, UPDATE, DELETE |
+| IS | Intent Shared | S, IS, IX, IU, SIX | Higher-level intent |
+| IX | Intent Exclusive | IS, IU | Higher-level intent |
+| Sch-S | Schema Stability | All except Sch-M | Query compilation |
+| Sch-M | Schema Modification | None | ALTER TABLE, DROP |
+| BU | Bulk Update | BU, Sch-S | BULK INSERT |
+
+Lock escalation: row → page → table. Disable per-table if needed:
+
+```sql
+ALTER TABLE Orders SET (LOCK_ESCALATION = DISABLE);  -- or ROW_OR_PAGE (2008+)
+```
+
 ### Wait Statistics Per Query
 
 ```sql
@@ -368,3 +448,11 @@ ORDER BY p.name, o.name;
 - [sys.fn_xe_file_target_read_file](https://learn.microsoft.com/en-us/sql/relational-databases/system-functions/sys-fn-xe-file-target-read-file-transact-sql)
 - [Use the system_health Session](https://learn.microsoft.com/en-us/sql/relational-databases/extended-events/use-the-system-health-session)
 - [SQL Trace Deprecation](https://learn.microsoft.com/en-us/sql/relational-databases/event-classes/sql-trace-event-classes)
+- [Monitor Deadlocks with system_health Extended Events](https://www.mssqltips.com/sqlservertip/6430/monitor-deadlocks-in-sql-server-with-systemhealth-extended-events/)
+- [Capturing Deadlock Information in XML Format](https://www.mssqltips.com/sqlservertip/1234/capturing-sql-server-deadlock-information-in-xml-format/)
+- [Report SQL Server Deadlock Occurrences](https://www.sqlshack.com/report-sql-server-deadlock-occurrences/)
+- [Save Deadlock Graphs with SQL Server Profiler](https://learn.microsoft.com/en-us/sql/relational-databases/performance/save-deadlock-graphs-sql-server-profiler)
+- [Transaction Locking and Row Versioning Guide](https://learn.microsoft.com/en-us/sql/relational-databases/sql-server-transaction-locking-and-row-versioning-guide)
+- [Modes of Transactions in SQL Server](https://www.sqlshack.com/modes-of-transactions-in-sql-server/)
+- [KILL SPID Command in SQL Server](https://www.sqlshack.com/kill-spid-command-in-sql-server/)
+- [Monitor AG with Extended Events](https://www.sqlshack.com/monitor-sql-server-always-on-availability-groups-using-extended-events/)

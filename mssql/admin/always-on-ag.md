@@ -458,6 +458,161 @@ WHERE connected_state_desc = 'DISCONNECTED';
 Test-NetConnection -ComputerName "SQLNODE02" -Port 5022
 ```
 
+## WSFC Quorum Modes and Voting
+
+Understanding quorum is essential for AG and FCI reliability. The quorum determines whether the cluster has enough votes to remain online.
+
+### Quorum Modes
+
+| Mode | Description | Use When |
+|------|-------------|----------|
+| Node Majority | More than half of voting nodes must be online | Odd number of nodes |
+| Node and File Share Majority | Nodes + file share witness vote | Even number of nodes |
+| Node and Disk Majority | Nodes + shared disk witness vote | FCIs with shared storage |
+| Cloud Witness (2016+) | Azure blob storage as witness | Cross-datacenter or hybrid |
+
+### Quorum DMVs
+
+```sql
+-- Check cluster quorum state
+SELECT
+    cluster_name,
+    quorum_type_desc,
+    quorum_state_desc
+FROM sys.dm_hadr_cluster;
+
+-- Check node voting weights
+SELECT
+    member_name,
+    member_type_desc,
+    member_state_desc,
+    number_of_quorum_votes
+FROM sys.dm_hadr_cluster_members;
+```
+
+### Voting Best Practices
+
+- Include all nodes hosting primary replicas and automatic failover targets
+- Exclude DR-site nodes from voting to prevent split-brain
+- Maintain an odd number of total votes (add witness if needed)
+- After forced quorum, reassess NodeWeight before bringing other nodes online
+
+### Forced Quorum Start (Disaster Recovery)
+
+When the cluster loses quorum due to a multi-node failure, force-start from the surviving node:
+
+```powershell
+# PowerShell: force cluster start without quorum
+Import-Module FailoverClusters
+$node = "SQLNODE01"
+Stop-ClusterNode -Name $node
+Start-ClusterNode -Name $node -FixQuorum
+
+# Set surviving node as voting member
+(Get-ClusterNode $node).NodeWeight = 1
+
+# Verify cluster state
+Get-ClusterNode -Cluster $node | Format-Table NodeName, State, NodeWeight
+```
+
+```cmd
+-- CMD alternative
+net.exe stop clussvc
+net.exe start clussvc /forcequorum
+```
+
+After forced quorum, immediately perform a forced AG failover if the primary was on a failed node:
+
+```sql
+ALTER AVAILABILITY GROUP [AG_Production] FORCE_FAILOVER_ALLOW_DATA_LOSS;
+```
+
+## Login Synchronization Across Replicas
+
+AGs replicate databases but **not logins**. After failover, applications fail if logins are missing or have mismatched SIDs on the new primary.
+
+### SID-Matched Login Script
+
+```sql
+-- Generate CREATE LOGIN scripts with matching SID and password hash
+SELECT
+    N'CREATE LOGIN [' + sp.name + N'] WITH PASSWORD = 0x' +
+    CONVERT(NVARCHAR(MAX), l.password_hash, 2) + N' HASHED, ' +
+    N'SID = 0x' + CONVERT(NVARCHAR(MAX), sp.sid, 2) +
+    N', DEFAULT_DATABASE = [' + sp.default_database_name + N']' +
+    CASE WHEN sp.is_disabled = 1 THEN N'; ALTER LOGIN [' + sp.name + N'] DISABLE;' ELSE N'' END
+FROM sys.server_principals AS sp
+JOIN sys.sql_logins AS l ON sp.sid = l.sid
+WHERE sp.type = 'S'
+    AND sp.name NOT LIKE '##%'
+    AND sp.name NOT IN ('sa')
+ORDER BY sp.name;
+```
+
+### DBATools Automation (Recommended)
+
+```powershell
+# Sync logins from primary to all secondary replicas
+$primaryReplica = Get-DbaAgReplica -SqlInstance $AGListener | Where Role -eq Primary
+$secondaryReplicas = Get-DbaAgReplica -SqlInstance $AGListener | Where Role -eq Secondary
+$loginsOnPrimary = Get-DbaLogin -SqlInstance $primaryReplica.Name
+
+$secondaryReplicas | ForEach-Object {
+    $loginsOnSecondary = Get-DbaLogin -SqlInstance $_.Name
+    $diff = $loginsOnPrimary | Where-Object Name -notin ($loginsOnSecondary.Name)
+    if ($diff) {
+        Copy-DbaLogin -Source $primaryReplica.Name -Destination $_.Name -Login $diff.Name
+    }
+}
+```
+
+### Orphaned User Detection and Remediation
+
+```sql
+-- Find orphaned database users (user exists in DB but no matching server login)
+SELECT dp.name AS OrphanedUser, dp.sid
+FROM sys.database_principals dp
+WHERE dp.type IN ('G', 'S', 'U')
+    AND dp.sid NOT IN (SELECT sid FROM sys.server_principals)
+    AND dp.name NOT IN ('dbo', 'guest', 'INFORMATION_SCHEMA', 'sys');
+
+-- Remap orphaned user to existing login
+ALTER USER [AppUser] WITH LOGIN = [AppUser];
+
+-- Auto-fix (login and user names must match)
+EXEC sp_change_users_login 'Auto_Fix', 'AppUser';
+```
+
+## MSDTC Configuration for AGs
+
+Distributed transactions across AG databases require MSDTC. Configure a clustered DTC resource per AG for SQL Server 2016+.
+
+```sql
+-- Enable DTC support when creating the AG
+CREATE AVAILABILITY GROUP [AG_Production]
+WITH (DTC_SUPPORT = PER_DB)
+FOR DATABASE [AppDB]
+REPLICA ON ...;
+
+-- Or enable on existing AG
+ALTER AVAILABILITY GROUP [AG_Production] SET (DTC_SUPPORT = PER_DB);
+```
+
+Best practice: create a dedicated clustered DTC instance for each AG rather than relying on the default local DTC.
+
+## AG vs Failover Cluster Instance (FCI)
+
+| Feature | Availability Group | Failover Cluster Instance |
+|---------|-------------------|--------------------------|
+| Failover scope | Per-database group | Entire SQL Server instance |
+| Readable secondaries | Yes | No |
+| Shared storage required | No | Yes |
+| Multiple databases | Select databases | All databases fail over |
+| Standard Edition | Basic AG (2 replicas, 1 DB) | Yes |
+| Instance-level objects | Not replicated (except Contained AG 2022) | Shared via same instance |
+
+FCIs and AGs can be combined: AG replicas can be hosted on FCI instances for both instance-level and database-level HA.
+
 ## Best Practices
 
 - Use synchronous commit mode only between replicas in the same datacenter or low-latency network to avoid commit latency impact.
@@ -503,3 +658,17 @@ Test-NetConnection -ComputerName "SQLNODE02" -Port 5022
 - [Monitor Availability Groups (Transact-SQL)](https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/monitor-availability-groups-transact-sql)
 - [Troubleshoot Always On Availability Groups Configuration](https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/troubleshoot-always-on-availability-groups-configuration-sql-server)
 - [Contained Availability Groups (SQL Server 2022)](https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/contained-availability-groups-overview)
+- [WSFC Quorum Modes and Voting Configuration](https://learn.microsoft.com/en-us/sql/sql-server/failover-clusters/windows/wsfc-quorum-modes-and-voting-configuration-sql-server)
+- [Force a WSFC Cluster to Start Without a Quorum](https://learn.microsoft.com/en-us/sql/sql-server/failover-clusters/windows/force-a-wsfc-cluster-to-start-without-a-quorum)
+- [WSFC Disaster Recovery Through Forced Quorum](https://learn.microsoft.com/en-us/sql/sql-server/failover-clusters/windows/wsfc-disaster-recovery-through-forced-quorum-sql-server)
+- [Synchronize Logins Between AG Replicas](https://www.sqlshack.com/synchronize-logins-between-availability-replicas-in-sql-server-always-on-availability-group/)
+- [Orphaned Database Users](https://www.sqlshack.com/how-to-discover-and-handle-orphaned-database-users-in-sql-server/)
+- [Configure Distributed Transactions for AG](https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/configure-availability-group-for-distributed-transactions)
+- [MSDTC Best Practices with AG](https://techcommunity.microsoft.com/t5/core-infrastructure-and-security/msdtc-best-practices-with-an-availability-group/ba-p/909429)
+- [AG vs FCI Comparison](https://www.starwindsoftware.com/blog/always-on-availability-groups-vs-failover-cluster/)
+- [Monitor AG with Extended Events](https://www.sqlshack.com/monitor-sql-server-always-on-availability-groups-using-extended-events/)
+- [AG Backups on Secondary Replicas](https://www.sqlshack.com/sql-server-always-on-availability-group-log-backup-on-secondary-replicas/)
+- [Data Synchronization in AGs](https://www.sqlshack.com/data-synchronization-in-sql-server-always-on-availability-groups/)
+- [Upgrade AG Replicas](https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/upgrading-always-on-availability-group-replica-instances)
+- [Multi-Subnet AG Configuration](https://www.mssqltips.com/sqlservertip/4597/configure-sql-server-alwayson-availability-group-on-a-multisubnet-cluster/)
+- [Configure Read-Only Routing for AG](https://www.sqlshack.com/how-to-configure-read-only-routing-for-an-availability-group-in-sql-server-2016/)

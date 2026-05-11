@@ -410,6 +410,67 @@ WHERE wait_type LIKE 'PAGE%LATCH%'
 ORDER BY wait_duration_ms DESC;
 ```
 
+## TempDB Space Monitoring and Troubleshooting
+
+```sql
+-- Per-session TempDB space usage (find the session consuming most space)
+SELECT
+    s.session_id, s.login_name, s.host_name, s.program_name,
+    u.internal_objects_alloc_page_count * 8 / 1024 AS internal_alloc_mb,
+    u.internal_objects_dealloc_page_count * 8 / 1024 AS internal_dealloc_mb,
+    u.user_objects_alloc_page_count * 8 / 1024 AS user_alloc_mb,
+    u.user_objects_dealloc_page_count * 8 / 1024 AS user_dealloc_mb,
+    st.text AS last_query
+FROM sys.dm_db_session_space_usage u
+JOIN sys.dm_exec_sessions s ON u.session_id = s.session_id
+OUTER APPLY sys.dm_exec_sql_text(s.most_recent_sql_handle) st
+WHERE (u.internal_objects_alloc_page_count + u.user_objects_alloc_page_count) > 0
+ORDER BY (u.internal_objects_alloc_page_count + u.user_objects_alloc_page_count) DESC;
+
+-- TempDB space breakdown: version store vs internal vs user objects
+SELECT
+    SUM(version_store_reserved_page_count) * 8 / 1024 AS version_store_mb,
+    SUM(internal_object_reserved_page_count) * 8 / 1024 AS internal_objects_mb,
+    SUM(user_object_reserved_page_count) * 8 / 1024 AS user_objects_mb,
+    SUM(unallocated_extent_page_count) * 8 / 1024 AS free_space_mb
+FROM sys.dm_db_file_space_usage;
+
+-- Active snapshot transactions holding version store space
+SELECT t.session_id, t.transaction_id, t.elapsed_time_seconds,
+    s.login_name, s.host_name, st.text AS last_query
+FROM sys.dm_tran_active_snapshot_database_transactions t
+JOIN sys.dm_exec_sessions s ON t.session_id = s.session_id
+CROSS APPLY sys.dm_exec_sql_text(s.most_recent_sql_handle) st
+ORDER BY t.elapsed_time_seconds DESC;
+```
+
+### TempDB Configuration Best Practices
+
+- Data files should equal logical CPU count, up to 8 (add more in groups of 4 only if contention persists)
+- All data files **must** be equal size for proportional fill to distribute evenly
+- Place TempDB on fast, dedicated storage separate from user databases
+- Enable instant file initialization (IFI) to avoid growth delays
+- Pre-size TempDB data and log files to avoid autogrowth during peak workload
+
+### Database Growth and Shrink Event Monitoring
+
+```sql
+-- Track autogrowth events via default trace
+SELECT
+    te.name AS event_name,
+    t.DatabaseName,
+    t.FileName,
+    t.StartTime,
+    DATEDIFF(MILLISECOND, t.StartTime, t.EndTime) AS duration_ms,
+    t.IntegerData * 8 / 1024 AS growth_mb,
+    t.ApplicationName, t.LoginName
+FROM fn_trace_gettable(
+    (SELECT path FROM sys.traces WHERE id = 1), DEFAULT) t
+JOIN sys.trace_events te ON t.EventClass = te.trace_event_id
+WHERE te.name LIKE '%Auto Grow%' OR te.name LIKE '%Auto Shrink%'
+ORDER BY t.StartTime DESC;
+```
+
 ## Instant File Initialization
 
 ```sql

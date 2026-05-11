@@ -313,6 +313,33 @@ WHERE dp.type = 'S'
   AND sp.sid IS NULL;
 ```
 
+## Unlocking Locked SQL Logins
+
+When password policy enforcement is enabled, SQL logins can be locked after repeated failed attempts.
+
+```sql
+-- Check if a login is locked
+SELECT name, is_disabled, is_locked,
+    LOGINPROPERTY(name, 'IsLocked') AS IsLocked,
+    LOGINPROPERTY(name, 'LockoutTime') AS LockoutTime,
+    LOGINPROPERTY(name, 'BadPasswordCount') AS BadPasswordCount,
+    LOGINPROPERTY(name, 'BadPasswordTime') AS LastBadPasswordTime
+FROM sys.sql_logins
+WHERE name = 'AppServiceAccount';
+
+-- Unlock without resetting the password (keeps existing password)
+ALTER LOGIN [AppServiceAccount] WITH PASSWORD = '$(EXISTING)' UNLOCK;
+
+-- If you don't know the password, temporarily disable policy to unlock
+ALTER LOGIN [AppServiceAccount] WITH CHECK_POLICY = OFF;
+ALTER LOGIN [AppServiceAccount] WITH CHECK_POLICY = ON;
+
+-- Unlock and reset password
+ALTER LOGIN [AppServiceAccount] WITH PASSWORD = 'N3wC0mpl3x!P@ss';
+```
+
+Always investigate why the lockout occurred — it may indicate brute-force attempts or a misconfigured application with stale credentials.
+
 ## EXECUTE AS and Impersonation
 
 ```sql

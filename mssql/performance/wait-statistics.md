@@ -399,6 +399,77 @@ SELECT
 FROM sys.dm_exec_query_resource_semaphores;
 ```
 
+## I/O Latency Assessment
+
+Use `sys.dm_io_virtual_file_stats` to assess per-file latency with Microsoft's recommended thresholds:
+
+```sql
+SELECT
+    DB_NAME(vfs.database_id) AS database_name,
+    mf.name AS logical_file_name,
+    mf.type_desc,
+    LEFT(mf.physical_name, 60) AS physical_name,
+    CASE WHEN num_of_reads = 0 THEN 0
+         ELSE (io_stall_read_ms / num_of_reads) END AS read_latency_ms,
+    CASE WHEN num_of_writes = 0 THEN 0
+         ELSE (io_stall_write_ms / num_of_writes) END AS write_latency_ms,
+    CASE WHEN (num_of_reads + num_of_writes) = 0 THEN 0
+         ELSE io_stall / (num_of_reads + num_of_writes) END AS avg_latency_ms,
+    CASE WHEN (num_of_reads + num_of_writes) = 0 THEN 'No data'
+         WHEN io_stall / (num_of_reads + num_of_writes) < 2 THEN 'Excellent'
+         WHEN io_stall / (num_of_reads + num_of_writes) < 6 THEN 'Very good'
+         WHEN io_stall / (num_of_reads + num_of_writes) < 16 THEN 'Good'
+         WHEN io_stall / (num_of_reads + num_of_writes) < 100 THEN 'Poor'
+         WHEN io_stall / (num_of_reads + num_of_writes) < 500 THEN 'Bad'
+         ELSE 'Deplorable' END AS latency_assessment,
+    num_of_reads, num_of_writes,
+    (num_of_bytes_read + num_of_bytes_written) / 1024 / 1024 AS total_io_mb
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs
+JOIN sys.master_files mf ON vfs.database_id = mf.database_id AND vfs.file_id = mf.file_id
+ORDER BY avg_latency_ms DESC;
+```
+
+Latency thresholds: < 2ms excellent, 2-5ms very good, 6-15ms good, 16-100ms poor (investigate), > 100ms bad. If Perfmon `Avg Disk Sec/Transfer` is fine but SQL Server reports high PAGEIOLATCH waits, check for filter drivers (antivirus, backup agents, encryption) between SQL Server and the disk.
+
+## PAGELATCH Contention (Hot Pages)
+
+PAGELATCH waits differ from PAGEIOLATCH — they indicate in-memory page contention, not disk I/O. Common in high-concurrency INSERT workloads on identity columns.
+
+### Diagnosis
+
+```sql
+-- Monitor active PAGELATCH waits with wait resource details
+SELECT wt.wait_duration_ms, wt.wait_type,
+    req.wait_resource, st.text,
+    DB_NAME(req.database_id) AS database_name
+FROM sys.dm_os_waiting_tasks wt
+JOIN sys.dm_exec_requests req ON wt.session_id = req.session_id
+JOIN sys.dm_exec_sessions ses ON ses.session_id = req.session_id
+CROSS APPLY sys.dm_exec_sql_text(req.sql_handle) st
+WHERE ses.is_user_process = 1
+    AND wt.wait_type LIKE 'PAGELATCH%';
+
+-- Non-buffer latch analysis
+SELECT latch_class, wait_time_ms, waiting_requests_count,
+    CAST(100.0 * wait_time_ms / SUM(wait_time_ms) OVER() AS DECIMAL(5,2)) AS pct
+FROM sys.dm_os_latch_stats
+WHERE latch_class NOT IN ('BUFFER') AND wait_time_ms > 0
+ORDER BY wait_time_ms DESC;
+```
+
+### Resolution: Hash Partitioning for Last-Page Insert Contention
+
+```sql
+-- Add computed hash column to distribute inserts across B-tree pages
+ALTER TABLE dbo.AuditLog
+    ADD HashBucket AS (CONVERT(INT, ABS(AuditID) % 32)) PERSISTED;
+
+-- Create clustered index with hash bucket as leading key
+CREATE CLUSTERED INDEX CIX_AuditLog ON dbo.AuditLog (HashBucket, AuditID);
+```
+
+Tradeoff: eliminates last-page contention but increases index key size and may cause page splits. For TempDB-specific latch contention, increase the number of TempDB data files (match logical CPU count up to 8).
+
 ## Signal Waits Analysis
 
 ```sql
@@ -490,3 +561,9 @@ FROM (
 - [Troubleshoot Slow Queries with Wait Statistics](https://learn.microsoft.com/en-us/sql/relational-databases/performance/best-practice-with-the-query-store#use-wait-statistics)
 - [sys.dm_exec_session_wait_stats](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-exec-session-wait-stats-transact-sql)
 - [Extended Events Overview](https://learn.microsoft.com/en-us/sql/relational-databases/extended-events/extended-events)
+- [SQL Server Wait Types](https://www.sqlshack.com/sql-server-wait-types/)
+- [All About Latches in SQL Server](https://www.sqlshack.com/all-about-latches-in-sql-server/)
+- [Identify and Resolve Hot Latches](https://www.sqlshack.com/how-to-identify-and-resolve-hot-latches-in-sql-server/)
+- [Troubleshoot Slow I/O Performance](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/troubleshoot-sql-io-performance)
+- [Locking in SQL Server](https://www.sqlshack.com/locking-sql-server/)
+- [Transaction Locking and Row Versioning Guide](https://learn.microsoft.com/en-us/sql/relational-databases/sql-server-transaction-locking-and-row-versioning-guide)

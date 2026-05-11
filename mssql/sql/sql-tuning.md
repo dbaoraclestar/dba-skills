@@ -437,6 +437,127 @@ WHERE d.database_id = DB_ID()
 ORDER BY improvement_score DESC;
 ```
 
+## Parameter Sniffing Deep Dive
+
+Parameter sniffing occurs when a plan compiled for one parameter value is reused for a different value with very different data distribution. The optimizer "sniffs" the parameter value on first execution and builds a plan optimized for it.
+
+### Diagnosis
+
+```sql
+-- Identify queries with high plan variance (multiple plans in Query Store)
+SELECT q.query_id, COUNT(DISTINCT p.plan_id) AS plan_count,
+    MIN(rs.avg_duration) / 1000 AS best_avg_ms,
+    MAX(rs.avg_duration) / 1000 AS worst_avg_ms
+FROM sys.query_store_query q
+JOIN sys.query_store_plan p ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+GROUP BY q.query_id
+HAVING COUNT(DISTINCT p.plan_id) > 1
+    AND MAX(rs.avg_duration) > MIN(rs.avg_duration) * 5
+ORDER BY (MAX(rs.avg_duration) - MIN(rs.avg_duration)) DESC;
+
+-- Quick test: clear specific plan and check if CPU drops
+-- DBCC FREEPROCCACHE(plan_handle) -- for targeted plan removal
+```
+
+### Solution Ranking
+
+| Approach | When to Use | Tradeoff |
+|----------|-------------|----------|
+| OPTION (RECOMPILE) | Infrequent queries, unpredictable parameters | CPU cost of recompilation on every execution |
+| OPTIMIZE FOR (@p = value) | You know the typical parameter value | Fails if data distribution shifts |
+| OPTIMIZE FOR UNKNOWN | Need stable generic plan | Uses density vector average; may not be optimal for any value |
+| Query Store hints (2022) | Can't modify application code | External hint management; must monitor force failures |
+| PSP optimization (2022) | Multiple distinct plan shapes needed | Automatic but limited to equality predicates on single parameter |
+
+### Anti-Pattern: Local Variable Workaround
+
+```sql
+-- AVOID: Hides parameter from optimizer, uses density-based estimate
+CREATE PROCEDURE dbo.GetOrders @CustomerID INT AS
+BEGIN
+    DECLARE @cid INT = @CustomerID;  -- Defeats sniffing but blindly
+    SELECT * FROM Orders WHERE CustomerID = @cid;
+END
+```
+
+This provides temporary relief but creates unpredictable plans long-term. Prefer OPTION (RECOMPILE) or OPTIMIZE FOR.
+
+## SARGability Patterns
+
+Non-sargable predicates force table/index scans and inflate CPU. Common patterns and fixes:
+
+```sql
+-- NON-SARGABLE: function on column
+WHERE YEAR(OrderDate) = 2024
+-- SARGABLE: range predicate
+WHERE OrderDate >= '2024-01-01' AND OrderDate < '2025-01-01'
+
+-- NON-SARGABLE: arithmetic on column
+WHERE UnitPrice * 0.10 > 300
+-- SARGABLE: move computation to constant side
+WHERE UnitPrice > 300 / 0.10
+
+-- NON-SARGABLE: SUBSTRING on indexed column
+WHERE SUBSTRING(ProductNumber, 1, 3) = 'HN-'
+-- SARGABLE: use LIKE prefix
+WHERE ProductNumber LIKE 'HN-%'
+
+-- NON-SARGABLE: ISNULL wrapping indexed column
+WHERE ISNULL(ShipDate, '1900-01-01') > '2024-01-01'
+-- SARGABLE: explicit NULL handling
+WHERE ShipDate IS NOT NULL AND ShipDate > '2024-01-01'
+
+-- NON-SARGABLE: CONVERT on join column
+SELECT * FROM T1 JOIN T2 ON CONVERT(INT, T1.ProdID) = T2.ProductID
+-- FIX: change column type or use computed column with index
+ALTER TABLE T1 ADD IntProdID AS CONVERT(INT, ProdID) PERSISTED;
+CREATE INDEX IX_IntProdID ON T1 (IntProdID);
+```
+
+SARGability applies to WHERE, JOIN, HAVING, GROUP BY, and ORDER BY clauses. CONVERT(), CAST(), ISNULL(), COALESCE() on indexed columns are the most frequent offenders.
+
+## High CPU Troubleshooting Workflow
+
+### Step 1: Identify CPU-bound queries currently running
+
+```sql
+SELECT TOP 10 r.session_id, r.status, r.cpu_time, r.logical_reads,
+    r.total_elapsed_time / (1000 * 60) AS elapsed_min,
+    SUBSTRING(st.text, (r.statement_start_offset / 2) + 1,
+        ((CASE r.statement_end_offset WHEN -1 THEN DATALENGTH(st.text)
+          ELSE r.statement_end_offset END - r.statement_start_offset) / 2) + 1) AS statement_text,
+    s.login_name, s.host_name, s.program_name
+FROM sys.dm_exec_sessions s
+JOIN sys.dm_exec_requests r ON r.session_id = s.session_id
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) st
+WHERE r.session_id != @@SPID
+ORDER BY r.cpu_time DESC;
+```
+
+### Step 2: Find historical CPU-heavy queries from plan cache
+
+```sql
+SELECT TOP 10
+    (qs.total_worker_time / 1000) / qs.execution_count AS avg_cpu_ms,
+    qs.execution_count,
+    qs.total_logical_reads / qs.execution_count AS avg_logical_reads,
+    SUBSTRING(st.text, (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(st.text)
+          ELSE qs.statement_end_offset END - qs.statement_start_offset) / 2) + 1) AS statement_text
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+ORDER BY qs.total_worker_time / qs.execution_count DESC;
+```
+
+### Step 3: Resolution priority
+
+1. Update statistics on tables used by top CPU queries
+2. Add missing indexes (check missing index DMVs)
+3. Fix SARGability issues in predicates
+4. Address parameter sniffing with appropriate hint
+5. If workload-level, consider scaling CPUs or raising cost threshold for parallelism
+
 ## Best Practices
 
 - Always check sargability first: ensure WHERE clause predicates do not wrap indexed columns in functions or expressions.
@@ -478,3 +599,8 @@ ORDER BY improvement_score DESC;
 - https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-exec-query-stats-transact-sql
 - https://learn.microsoft.com/en-us/sql/relational-databases/performance/parameter-sensitivity-plan-optimization
 - https://learn.microsoft.com/en-us/sql/relational-databases/indexes/indexes
+- [Parameter Sniffing Deep Dive](https://www.sqlshack.com/query-optimization-techniques-in-sql-server-parameter-sniffing/)
+- [Query Optimization Basics](https://www.sqlshack.com/query-optimization-techniques-in-sql-server-the-basics/)
+- [Troubleshoot High CPU Usage](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/troubleshoot-high-cpu-usage-issues)
+- [Troubleshoot Slow I/O Performance](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/troubleshoot-sql-io-performance)
+- [Identify Slow Running Queries](https://www.sqlshack.com/how-to-identify-slow-running-queries-in-sql-server/)

@@ -258,16 +258,35 @@ SELECT
 FROM sys.dm_exec_cached_plans
 WHERE usecounts = 1 AND objtype = 'Adhoc';
 
+-- Analyze plan cache by type — identify ad hoc bloat
+SELECT objtype AS PlanCacheType,
+    COUNT_BIG(1) AS NumOfPlans,
+    SUM(CAST(size_in_bytes AS DECIMAL(18,2))) / 1024 / 1024 AS PlanSizeMB
+FROM sys.dm_exec_cached_plans
+GROUP BY objtype
+ORDER BY NumOfPlans DESC;
+
 -- Enable "Optimize for Ad Hoc Workloads" to reduce plan cache bloat
--- Stores only a plan stub on first execution; full plan cached on reuse
+-- First execution: stores 384-byte plan stub instead of full 16KB+ plan
+-- Second execution: stub replaced with full plan for reuse
+-- Only affects newly cached plans; existing plans remain unchanged
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
 EXEC sp_configure 'optimize for ad hoc workloads', 1;
 RECONFIGURE;
 
--- Clear the entire plan cache (use cautiously in production)
+-- Clear the entire plan cache (use cautiously in production — causes recompilation storm)
 DBCC FREEPROCCACHE;
 
--- Clear a specific plan from cache
+-- Clear a specific plan from cache (preferred — surgical removal)
 DBCC FREEPROCCACHE(0x06000700A421E826409CE8E5A300000001000000000000000000000000000000);
+
+-- Find plan handle for a specific query pattern
+SELECT text,
+    'DBCC FREEPROCCACHE (0x' + CONVERT(VARCHAR(512), plan_handle, 2) + ')' AS freeproc_cmd
+FROM sys.dm_exec_cached_plans
+CROSS APPLY sys.dm_exec_sql_text(plan_handle)
+WHERE text LIKE '%YourTableName%';
 ```
 
 ## Forced Parameterization and Plan Guides
@@ -361,3 +380,8 @@ EXEC sp_query_store_unforce_plan @query_id = 42, @plan_id = 87;
 - [Query Processing Architecture Guide](https://learn.microsoft.com/en-us/sql/relational-databases/query-processing-architecture-guide)
 - [Query Store Overview](https://learn.microsoft.com/en-us/sql/relational-databases/performance/monitoring-performance-by-using-the-query-store)
 - [Intelligent Query Processing](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing)
+- [Saving and Analyzing Execution Plans](https://www.sqlshack.com/saving-your-sql-execution-plan/)
+- [How to Analyze Execution Plan Graphical Components](https://www.sqlshack.com/how-to-analyze-sql-execution-plan-graphical-components/)
+- [Using Execution Plans for Query Tuning](https://www.sqlshack.com/using-the-sql-execution-plan-for-query-performance-tuning/)
+- [Searching the Plan Cache](https://www.sqlshack.com/searching-the-sql-server-query-plan-cache/)
+- [Optimize for Ad Hoc Workloads](https://www.sqlshack.com/saving-the-plan-cache-storage-using-the-optimize-for-ad-hoc-workloads-option/)

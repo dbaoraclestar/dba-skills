@@ -366,6 +366,58 @@ HAVING SUM(ps.reserved_page_count) > 128  -- > 1MB
 ORDER BY index_mb DESC;
 ```
 
+## Non-Clustered Index Design Principles
+
+### Column Ordering in Composite Indexes
+
+Place equality predicate columns before range predicate columns in the index key:
+
+```sql
+-- Query pattern: WHERE Status = 'Active' AND OrderDate > '2024-01-01'
+-- GOOD: equality column first, range column second
+CREATE NONCLUSTERED INDEX IX_Orders_Status_Date
+ON Orders (Status, OrderDate)
+INCLUDE (CustomerID, TotalAmount);
+
+-- BAD: range column first — cannot seek past first column
+CREATE NONCLUSTERED INDEX IX_Orders_Date_Status
+ON Orders (OrderDate, Status);
+```
+
+### INCLUDE vs Key Columns
+
+Use INCLUDE for columns needed only in the SELECT list or JOIN output — they are stored at leaf level only, keeping the B-tree narrow for seeks:
+
+```sql
+-- Covering index: eliminates Key Lookups for this query pattern
+CREATE NONCLUSTERED INDEX IX_Orders_Customer
+ON Orders (CustomerID)
+INCLUDE (OrderDate, TotalAmount, ShipAddress)
+WITH (ONLINE = ON, FILLFACTOR = 90);
+```
+
+INCLUDE supports up to 1023 non-key columns and allows data types prohibited in key columns (VARCHAR(MAX), XML, etc.).
+
+### Filtered Indexes for Subset Queries
+
+```sql
+-- Index only active orders — smaller, faster, less maintenance
+CREATE NONCLUSTERED INDEX IX_Orders_ActiveOnly
+ON Orders (CustomerID, OrderDate)
+WHERE Status = 'Active';
+
+-- Filtered index for NULL-handling queries
+CREATE NONCLUSTERED INDEX IX_Orders_Unshipped
+ON Orders (OrderDate)
+WHERE ShipDate IS NULL;
+```
+
+### When to Create vs Skip
+
+Create when: table has high read-to-write ratio, queries consistently filter on same columns, execution plans show scans or Key Lookups on hot queries.
+
+Skip when: table is write-heavy (every index adds INSERT/UPDATE/DELETE overhead), the column has very low cardinality (Gender, Boolean), or an existing index can be extended with INCLUDE columns instead.
+
 ## Best Practices
 
 - Choose a narrow, unique, ever-increasing, static clustered index key (IDENTITY or SEQUENCE columns are ideal)
@@ -409,3 +461,9 @@ ORDER BY index_mb DESC;
 - [Missing Index DMVs](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-db-missing-index-details-transact-sql)
 - [Resumable Index Operations](https://learn.microsoft.com/en-us/sql/relational-databases/indexes/guidelines-for-online-index-operations)
 - [Index Architecture and Design Guide](https://learn.microsoft.com/en-us/sql/relational-databases/sql-server-index-design-guide)
+- [Overview of Clustered Indexes](https://www.sqlshack.com/overview-of-sql-server-clustered-index/)
+- [Overview of Non-Clustered Indexes](https://www.sqlshack.com/overview-of-non-clustered-indexes-in-sql-server/)
+- [Designing Effective Clustered Indexes](https://www.sqlshack.com/designing-effective-sql-server-clustered-indexes/)
+- [Designing Effective Non-Clustered Indexes](https://www.sqlshack.com/designing-effective-sql-server-non-clustered-indexes/)
+- [Non-Clustered Indexes with Included Columns](https://www.sqlshack.com/sql-server-non-clustered-indexes-with-included-columns/)
+- [SQL Server Indexes Series](https://www.sqlshack.com/sql-server-indexes-series-intro/)

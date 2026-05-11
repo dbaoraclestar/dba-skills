@@ -293,6 +293,40 @@ WHERE schema_name = 'HR'
 ORDER BY event_time DESC;
 ```
 
+## Transaction Log as Audit Trail
+
+The transaction log (`fn_dblog`) provides a last-resort audit capability for DML changes when no formal audit was configured. Useful for forensic investigation after data changes.
+
+```sql
+-- Read the active transaction log for recent operations
+SELECT
+    [Current LSN], Operation, Context,
+    [Transaction ID], [Begin Time],
+    OBJECT_NAME([Lock Information]) AS ObjectName,
+    [RowLog Contents 0], [RowLog Contents 1]
+FROM fn_dblog(NULL, NULL)
+WHERE Operation IN ('LOP_INSERT_ROWS', 'LOP_DELETE_ROWS', 'LOP_MODIFY_ROW')
+ORDER BY [Current LSN] DESC;
+
+-- Read backed-up transaction log for point-in-time investigation
+SELECT *
+FROM fn_dump_dblog(NULL, NULL, N'DISK', 1,
+    N'E:\Backups\AppDB_log.trn',
+    DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+    DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+    DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+    DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+    DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+    DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+    DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+    DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+    DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+    DEFAULT, DEFAULT)
+WHERE Operation IN ('LOP_INSERT_ROWS', 'LOP_DELETE_ROWS', 'LOP_MODIFY_ROW');
+```
+
+Note: `fn_dblog` is undocumented and unsupported. For production audit requirements, always use SQL Server Audit or temporal tables.
+
 ## C2 Audit Mode and Common Criteria
 
 ```sql
@@ -440,3 +474,7 @@ ORDER BY AuditDate DESC;
 - [fn_get_audit_file](https://learn.microsoft.com/en-us/sql/relational-databases/system-functions/sys-fn-get-audit-file-transact-sql)
 - [Common Criteria Compliance](https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/common-criteria-compliance-enabled-server-configuration-option)
 - [SQL Server Audit Records](https://learn.microsoft.com/en-us/sql/relational-databases/security/auditing/sql-server-audit-records)
+- [View a SQL Server Audit Log](https://learn.microsoft.com/en-us/sql/relational-databases/security/auditing/view-a-sql-server-audit-log)
+- [C2 Audit Mode Server Configuration Option](https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/c2-audit-mode-server-configuration-option)
+- [SQL Server Database Auditing Techniques](https://solutioncenter.apexsql.com/sql-server-database-auditing-techniques/)
+- [Read a SQL Server Transaction Log](https://solutioncenter.apexsql.com/read-a-sql-server-transaction-log/)
